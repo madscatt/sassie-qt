@@ -26,3 +26,10 @@ read-only references, or copy from them as needed:
 `zazmol` is a temporary name for the development version of SASMOL. The old
 SASSIE project is being retired. As this project moves forward, repository and
 package names may change from `z*` names back to `s*` names.
+
+## Coding Style
+
+- Prefer snake_case for class and method names, such as `name_of_function`,
+  instead of PascalCase names such as `NameOfFunction`.
+- Prefer self-defining variable names. For example, use `number_of_atoms`
+  instead of abbreviated names such as `natoms`.
