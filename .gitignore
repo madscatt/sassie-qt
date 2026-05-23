@@ -1,0 +1,56 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.python-version
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Qt / C++ / CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+compile_commands.json
+Makefile
+*.autosave
+*.pro.user
+*.qbs.user
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# Build artifacts
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+*.app/
+
+# Logs and local runtime data
+*.log
+*.tmp
+*.bak
+*.local
