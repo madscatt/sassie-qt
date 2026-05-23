@@ -59,11 +59,7 @@ def test_load_menu_includes_all_canonical_sections():
         ],
         "admin": [
             "jobmonitor",
-            "jobintegritycheck",
-            "sysuserslist",
-            "sys_manage_users",
             "jobshistory_1",
-            "layout_designer",
         ],
         "etc": ["sys_file_manager"],
     }
@@ -75,6 +71,10 @@ def test_load_module_definition_reads_data_interpolation_fields():
     assert module is not None
     assert module.id == "data_interpolation"
     assert any(field.id == "data_file_name" for field in module.fields)
+    run_name = next(field for field in module.fields if field.id == "run_name")
+    assert "results will be placed" in run_name.help_text
+    assert "<br>" not in run_name.help_text
+    assert "\nNote that only alphanumeric" in run_name.help_text
 
 
 def test_load_module_definition_reads_non_tools_root_module_json():

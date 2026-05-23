@@ -59,6 +59,12 @@ class DataInterpolationRunner:
     ) -> DataInterpolationResult:
         message_callback = message_callback or _ignore_message
         progress_callback = progress_callback or _ignore_progress
+        recent_messages: list[str] = []
+
+        def record_message(message: str) -> None:
+            recent_messages.append(str(message))
+            del recent_messages[:-8]
+            message_callback(message)
 
         self.validate_desktop_inputs(inputs)
         variables = self.prepare_variables(inputs)
@@ -71,7 +77,7 @@ class DataInterpolationRunner:
         if run_path.exists():
             shutil.rmtree(run_path)
 
-        message_callback("starting job\n")
+        record_message("starting job\n")
         progress_callback(0.01)
 
         with _working_directory(run_directory):
@@ -85,14 +91,12 @@ class DataInterpolationRunner:
             self._drain_queue_while_running(
                 process,
                 txt_queue,
-                message_callback,
+                record_message,
                 progress_callback,
             )
             process.join(timeout=1.0)
             if process.exitcode not in (0, None):
-                raise RuntimeError(
-                    f"data_interpolation exited with status {process.exitcode}"
-                )
+                raise RuntimeError(_process_failure_message(process.exitcode, recent_messages))
 
         progress_callback(1.0)
         return DataInterpolationResult(
@@ -213,3 +217,11 @@ def _ignore_message(_message: str) -> None:
 
 def _ignore_progress(_progress: float) -> None:
     return
+
+
+def _process_failure_message(exitcode: int | None, recent_messages: list[str]) -> str:
+    message = f"data_interpolation exited with status {exitcode}"
+    recent_text = "".join(recent_messages).strip()
+    if recent_text:
+        message += "\n\nRecent run log:\n" + recent_text
+    return message

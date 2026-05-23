@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import html
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,14 @@ from typing import Any
 
 DEFAULT_GENAPP_ZAZZIE_ROOT = Path.home() / "git_working_copies" / "genapp_zazzie"
 DEFAULT_ZAZZIE_ROOT = Path.home() / "git_working_copies" / "zazzie"
+HIDDEN_ADMIN_MODULE_IDS = frozenset(
+    {
+        "jobintegritycheck",
+        "sysuserslist",
+        "sys_manage_users",
+        "layout_designer",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +78,17 @@ def _truthy(value: Any) -> bool:
     return str(value).lower() == "true"
 
 
+def _clean_help_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    text = str(value)
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+
 def _clean_label(module_id: str) -> str:
     if module_id == "etc":
         return "File Manager"
@@ -83,6 +104,9 @@ def load_menu(genapp_zazzie_root: Path = DEFAULT_GENAPP_ZAZZIE_ROOT) -> tuple[Me
 
     for raw_group in menu_data.get("menu", []):
         raw_modules = raw_group.get("modules", [])
+        icon = raw_group.get("icon")
+        icon_path = genapp_zazzie_root / icon if icon else None
+        group_id = raw_group["id"]
         modules = tuple(
             ModuleMenuItem(
                 id=raw_module["id"],
@@ -90,10 +114,11 @@ def load_menu(genapp_zazzie_root: Path = DEFAULT_GENAPP_ZAZZIE_ROOT) -> tuple[Me
                 views=tuple(raw_module.get("views", ("Input", "Output", "Plots", "OpenGL"))),
             )
             for raw_module in raw_modules
+            if not (
+                group_id == "admin"
+                and raw_module["id"] in HIDDEN_ADMIN_MODULE_IDS
+            )
         )
-        icon = raw_group.get("icon")
-        icon_path = genapp_zazzie_root / icon if icon else None
-        group_id = raw_group["id"]
         groups.append(
             MenuGroup(
                 id=group_id,
@@ -130,7 +155,7 @@ def load_module_definition(
                 default=raw_field.get("default"),
                 values=raw_field.get("values"),
                 required=_truthy(raw_field.get("required")),
-                help_text=raw_field.get("help", ""),
+                help_text=_clean_help_text(raw_field.get("help")),
             )
         )
 

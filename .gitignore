@@ -57,3 +57,4 @@ ui_*.h
 .last_sas*.json
 run_*/
 new_project/
+no_project_specified/

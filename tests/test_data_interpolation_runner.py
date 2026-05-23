@@ -5,6 +5,7 @@ import pytest
 from sassie_qt.runners.data_interpolation_runner import (
     DataInterpolationInput,
     DataInterpolationRunner,
+    _process_failure_message,
 )
 
 
@@ -74,3 +75,11 @@ def test_data_interpolation_runner_rejects_empty_data_file(tmp_path):
                 maximum_points="16",
             )
         )
+
+
+def test_process_failure_message_includes_recent_log_lines():
+    message = _process_failure_message(1, ["starting job\n", "last useful line\n"])
+
+    assert "data_interpolation exited with status 1" in message
+    assert "Recent run log:" in message
+    assert "last useful line" in message
