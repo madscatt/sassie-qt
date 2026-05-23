@@ -54,3 +54,6 @@ ui_*.h
 *.tmp
 *.bak
 *.local
+.last_sas*.json
+run_*/
+new_project/

@@ -1,0 +1,2 @@
+"""SASSIE Qt prototype package."""
+
