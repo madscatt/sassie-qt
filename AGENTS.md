@@ -34,6 +34,37 @@ package names may change from `z*` names back to `s*` names.
 Use the Python installation under `~/anaconda3`. The `sasmol` and `sassie`
 packages are installed there.
 
+Use PySide6 for Qt development in this repository. Do not mix PySide6 with
+PyQt bindings in the same application.
+
+## Molecular Viewer Renderer Guidance
+
+For the desktop molecular viewer, prefer VTK/PyVistaQt as the primary renderer
+unless a product requirement explicitly demands native Metal/Direct3D/Vulkan
+alignment through Qt RHI. VTK is the lower-risk molecular visualization path
+because it already provides mature scientific rendering, Qt integration, and
+cross-platform GPU display support.
+
+Use Qt Quick 3D / Qt RHI as an evaluation or secondary renderer path when
+platform-native graphics abstraction is a hard requirement, but expect more
+custom molecular-visualization work for bonds, ribbons, surfaces, picking,
+selection, and specialized representations.
+
+Local prototype timing notes are intentionally untracked scratch files unless
+they are promoted into tracked documentation. If present, they can be useful as
+rough renderer references:
+
+- `PyVistaQt_VTK_renderer_timings.md`: PyVistaQt/VTK point-cloud rendering
+  handled the 6,730-atom HIV Gag trajectory at about 113 coordinate updates/s.
+- `QtQuick3D_RHI_renderer_timings.md`: Qt Quick 3D / Qt RHI with Metal and
+  sphere instancing handled the same trajectory at about 59 displayed
+  updates/s, apparently vsync/display-cadence limited.
+
+For either renderer, decouple simulation from display. Accept coordinates as
+fast as the simulation engine produces them, keep the latest displayable frame
+for interactive viewing, and render on a fixed 30 or 60 Hz GUI cadence so the
+renderer does not back-pressure simulation.
+
 ## Coding Style
 
 - Prefer snake_case for class and method names, such as `name_of_function`,

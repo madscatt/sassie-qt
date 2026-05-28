@@ -1,0 +1,2 @@
+"""pdbscan Qt module integration."""
+

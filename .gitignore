@@ -55,6 +55,14 @@ ui_*.h
 *.bak
 *.local
 .last_sas*.json
+.last_sas*.json_backup
 run_*/
 new_project/
 no_project_specified/
+
+# Local prototype/runtime scratch files
+/io.mc
+/sans_data.sub
+/prototypes/
+/PyVistaQt_VTK_renderer_timings.md
+/QtQuick3D_RHI_renderer_timings.md

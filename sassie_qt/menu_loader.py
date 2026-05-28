@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sassie_qt.value_helpers import truthy
+
 
 DEFAULT_GENAPP_ZAZZIE_ROOT = Path.home() / "git_working_copies" / "genapp_zazzie"
 DEFAULT_ZAZZIE_ROOT = Path.home() / "git_working_copies" / "zazzie"
@@ -54,6 +56,15 @@ class ModuleField:
     values: Any = None
     required: bool = False
     help_text: str = ""
+    checked: bool = False
+    repeat: str = ""
+    repeater: bool = False
+    hidden: bool = False
+    sync: str = ""
+    minimum: int | None = None
+    calc: str = ""
+    readonly: bool = False
+    headers: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -72,10 +83,6 @@ def _strip_hash_comment_lines(text: str) -> str:
     return "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith("#")
     )
-
-
-def _truthy(value: Any) -> bool:
-    return str(value).lower() == "true"
 
 
 def _clean_help_text(value: Any) -> str:
@@ -146,16 +153,33 @@ def load_module_definition(
     fields: list[ModuleField] = []
     for raw_field in module_data.get("fields", []):
         field_id = raw_field.get("id") or raw_field.get("name") or "(unnamed)"
+        default = raw_field.get("default")
+        checked = truthy(raw_field.get("checked"))
+        if raw_field.get("type") == "checkbox" and "default" not in raw_field:
+            default = "true" if checked else "false"
         fields.append(
             ModuleField(
                 id=field_id,
                 label=raw_field.get("label") or _clean_label(field_id),
                 field_type=raw_field.get("type", "unknown"),
                 role=raw_field.get("role", "input"),
-                default=raw_field.get("default"),
+                default=default,
                 values=raw_field.get("values"),
-                required=_truthy(raw_field.get("required")),
+                required=truthy(raw_field.get("required")),
                 help_text=_clean_help_text(raw_field.get("help")),
+                checked=checked,
+                repeat=str(raw_field.get("repeat") or ""),
+                repeater=truthy(raw_field.get("repeater")),
+                hidden=truthy(raw_field.get("hidden")),
+                sync=str(raw_field.get("sync") or ""),
+                minimum=(
+                    int(raw_field["min"])
+                    if raw_field.get("min") not in (None, "")
+                    else None
+                ),
+                calc=str(raw_field.get("calc") or ""),
+                readonly=truthy(raw_field.get("readonly")),
+                headers=raw_field.get("headers"),
             )
         )
 

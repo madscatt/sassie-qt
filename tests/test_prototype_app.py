@@ -9,11 +9,16 @@ from PySide6.QtWidgets import QApplication, QLabel, QProgressBar, QPushButton
 from sassie_qt.menu_loader import (
     DEFAULT_GENAPP_ZAZZIE_ROOT,
     DEFAULT_ZAZZIE_ROOT,
+    ModuleField,
     load_menu,
 )
+from sassie_qt.module_registry import MODULE_RUNNER_FACTORIES
+from sassie_qt.modules.data_interpolation.runner import DataInterpolationRunner
 from sassie_qt.plotting.data_interpolation_plot import build_data_interpolation_figure
 from sassie_qt.prototype_app import (
     DataInterpolationPlotWidget,
+    JsonIntegerPairRepeatingFieldRows,
+    JsonRepeatingFieldRows,
     SassieQtPrototype,
     configure_qt_plugin_paths,
     default_project_directory,
@@ -104,7 +109,7 @@ def test_data_interpolation_page_exposes_bound_inputs_and_outputs():
         for index in range(page.view_tabs.count())
     ] == ["Input", "Output", "Plots"]
     page.input_rows["data_file_name"].set_value(FIXTURE_DATA)
-    assert page._collect_data_interpolation_inputs().run_name == "run_0"
+    assert page._collect_form_values()["run_name"] == "run_0"
     app.processEvents()
 
 
@@ -128,10 +133,7 @@ def test_data_interpolation_uses_app_project_directory(tmp_path):
 
     assert page is not None
     page.input_rows["data_file_name"].set_value(FIXTURE_DATA)
-    assert (
-        page._collect_data_interpolation_inputs().run_directory
-        == project_directory.resolve()
-    )
+    assert page.project_directory == project_directory.resolve()
     assert project_directory.is_dir()
     assert window.project_directory_edit.text() == str(project_directory.resolve())
     app.processEvents()
@@ -175,7 +177,7 @@ def test_file_inputs_copy_selected_files_into_project_directory(tmp_path):
     assert row._file_dialog_start_directory(row.value()) == str(
         source_file.parent.resolve()
     )
-    assert page._collect_data_interpolation_inputs().data_file_name == project_file
+    assert page._collect_form_values()["data_file_name"] == str(project_file)
     app.processEvents()
 
 
@@ -205,8 +207,8 @@ def test_remembered_file_directory_survives_module_tab_rebuild(tmp_path):
     assert page is not None
     page.input_rows["data_file_name"].file_source_directory_recorder(source_file)
 
-    window.category_list.setCurrentRow(1)
-    window.category_list.setCurrentRow(0)
+    _select_category(window, "Build")
+    _select_category(window, "Tools")
 
     rebuilt_page = None
     for index in range(window.module_tabs.count()):
@@ -454,6 +456,280 @@ def test_data_interpolation_page_rejects_empty_data_file():
 
     assert page is not None
     page.input_rows["data_file_name"].reset_value()
-    with pytest.raises(ValueError, match="Choose an experimental data file"):
-        page._collect_data_interpolation_inputs()
+    with pytest.raises(ValueError, match="experimental data file"):
+        DataInterpolationRunner().prepare_variables(
+            page.project_directory,
+            page._collect_form_values(),
+        )
     app.processEvents()
+
+
+def test_extract_utilities_uses_real_repeaters():
+    configure_qt_plugin_paths()
+    app = QApplication.instance() or QApplication([])
+    window = SassieQtPrototype(
+        load_menu(DEFAULT_GENAPP_ZAZZIE_ROOT),
+        DEFAULT_GENAPP_ZAZZIE_ROOT,
+        DEFAULT_ZAZZIE_ROOT,
+    )
+
+    page = _module_page(window, "Extract Utilities")
+    assert page is not None
+
+    assert page.input_rows["pdb_filename"].isHidden()
+    page.input_rows["trajectory_checkbox"].value_widget.setChecked(True)
+    app.processEvents()
+    assert not page.input_rows["pdb_filename"].isHidden()
+
+    _set_combo_value(page.input_rows["option_list_box"].value_widget, "c4")
+    app.processEvents()
+    assert not page.input_rows["local_value_c4"].isHidden()
+    assert page.input_rows["local_value_c1"].isHidden()
+
+    page.input_rows["sas_checkbox"].value_widget.setChecked(True)
+    page.input_rows["number_of_sas_paths"].set_value("3")
+    app.processEvents()
+    sas_paths = page.input_rows["sas_paths"]
+    assert isinstance(sas_paths, JsonRepeatingFieldRows)
+    assert len(sas_paths.rows) == 3
+    assert "sas_paths" in page._collect_form_values()
+
+
+def test_merge_utilities_syncs_integer_repeaters():
+    configure_qt_plugin_paths()
+    app = QApplication.instance() or QApplication([])
+    window = SassieQtPrototype(
+        load_menu(DEFAULT_GENAPP_ZAZZIE_ROOT),
+        DEFAULT_GENAPP_ZAZZIE_ROOT,
+        DEFAULT_ZAZZIE_ROOT,
+    )
+
+    page = _module_page(window, "Merge Utilities")
+    assert page is not None
+
+    page.input_rows["trajectory_checkbox"].value_widget.setChecked(True)
+    page.input_rows["number_of_runs_to_merge"].set_value("4")
+    app.processEvents()
+
+    trajectory_names = page.input_rows["trajectory_names"]
+    assert isinstance(trajectory_names, JsonRepeatingFieldRows)
+    assert len(trajectory_names.rows) == 4
+    assert page.input_rows["number_of_trajectories"].isHidden()
+
+
+def test_build_utilities_uses_real_repeaters():
+    configure_qt_plugin_paths()
+    app = QApplication.instance() or QApplication([])
+    window = SassieQtPrototype(
+        load_menu(DEFAULT_GENAPP_ZAZZIE_ROOT),
+        DEFAULT_GENAPP_ZAZZIE_ROOT,
+        DEFAULT_ZAZZIE_ROOT,
+    )
+
+    _select_category(window, "Build")
+    page = _module_page(window, "Build Utilities")
+    assert page is not None
+
+    assert not page.input_rows["input_pdbfile"].isHidden()
+    assert page.input_rows["fasta_output_filename"].isHidden()
+
+    _set_combo_value(page.input_rows["pdb_choices_listbox"].value_widget, "c2")
+    page.input_rows["number_of_constraint_files"].set_value("3")
+    app.processEvents()
+    constraint_options = page.input_rows["constraint_listbox"]
+    constraint_filenames = page.input_rows["constraint_pdb_files"]
+    assert isinstance(constraint_options, JsonRepeatingFieldRows)
+    assert isinstance(constraint_filenames, JsonRepeatingFieldRows)
+    assert len(constraint_options.rows) == 3
+    assert len(constraint_filenames.rows) == 3
+
+    _set_combo_value(page.input_rows["build_utilities_listbox"].value_widget, "c2")
+    app.processEvents()
+    assert page.input_rows["input_pdbfile"].isHidden()
+    assert not page.input_rows["fasta_output_filename"].isHidden()
+    assert not page.input_rows["fasta_input_sequence"].isHidden()
+    assert page.input_rows["fasta_input_file"].isHidden()
+
+    _set_combo_value(page.input_rows["fasta_listbox"].value_widget, "c2")
+    app.processEvents()
+    assert page.input_rows["fasta_input_sequence"].isHidden()
+    assert not page.input_rows["fasta_input_file"].isHidden()
+
+
+def test_simulate_modules_are_registered_and_use_repeaters():
+    configure_qt_plugin_paths()
+    app = QApplication.instance() or QApplication([])
+    window = SassieQtPrototype(
+        load_menu(DEFAULT_GENAPP_ZAZZIE_ROOT),
+        DEFAULT_GENAPP_ZAZZIE_ROOT,
+        DEFAULT_ZAZZIE_ROOT,
+    )
+
+    expected_runner_ids = {
+        "torsion_angle_monte_carlo",
+        "monomer_monte_carlo",
+        "complex_monte_carlo",
+        "energy_minimization",
+        "openmm",
+        "torsion_angle_md",
+        "prody",
+    }
+    assert expected_runner_ids <= set(MODULE_RUNNER_FACTORIES)
+
+    _select_category(window, "Simulate")
+    simulate_tab_labels = {
+        window.module_tabs.tabText(index)
+        for index in range(window.module_tabs.count())
+    }
+    assert {
+        "Torsion Angle Monte Carlo",
+        "Monomer Monte Carlo",
+        "Complex Monte Carlo",
+        "Energy Minimization",
+        "OpenMM",
+        "Torsion Angle MD",
+        "Prody",
+    } <= simulate_tab_labels
+
+    page = _module_page(window, "Torsion Angle Monte Carlo")
+    assert page is not None
+    page.input_rows["number_of_flexible_regions"].set_value("2")
+    app.processEvents()
+    assert isinstance(page.input_rows["basis_string_array"], JsonRepeatingFieldRows)
+    assert len(page.input_rows["basis_string_array"].rows) == 2
+
+    page = _module_page(window, "Energy Minimization")
+    assert page is not None
+    assert not page.input_rows["nsteps_1"].isHidden()
+    assert page.input_rows["mdsteps_1"].isHidden()
+    _set_combo_value(page.input_rows["md_list_box"].value_widget, "c2")
+    app.processEvents()
+    assert page.input_rows["nsteps_1"].isHidden()
+    assert not page.input_rows["mdsteps_1"].isHidden()
+
+
+def test_contrast_modules_are_registered_and_use_integer_pair_repeaters():
+    configure_qt_plugin_paths()
+    app = QApplication.instance() or QApplication([])
+    window = SassieQtPrototype(
+        load_menu(DEFAULT_GENAPP_ZAZZIE_ROOT),
+        DEFAULT_GENAPP_ZAZZIE_ROOT,
+        DEFAULT_ZAZZIE_ROOT,
+    )
+
+    expected_runner_ids = {
+        "contrast_calculator",
+        "multi_component_analysis",
+        "contrast_variation_analysis",
+        "rg_center_of_mass_distance_calculator",
+    }
+    assert expected_runner_ids <= set(MODULE_RUNNER_FACTORIES)
+
+    _select_category(window, "Contrast")
+    page = _module_page(window, "Multi-Component Analysis")
+    assert page is not None
+
+    _set_combo_value(page.input_rows["multi_component_analysis_listbox"].value_widget, "c3")
+    page.input_rows["number_of_contrast_points_decomposition"].set_value("3")
+    page.input_rows["number_of_components_decomposition"].set_value("2")
+    app.processEvents()
+
+    delta_rho = page.input_rows["delta_rho_decomposition"]
+    assert isinstance(delta_rho, JsonIntegerPairRepeatingFieldRows)
+    assert len(delta_rho.edits) == 3
+    assert len(delta_rho.edits[0]) == 2
+    assert page.input_rows["mpair_decomposition"].isHidden()
+    assert not delta_rho.isHidden()
+    assert delta_rho.value().count(";") == 2
+
+
+def test_repeating_field_resize_preserves_existing_values():
+    configure_qt_plugin_paths()
+    QApplication.instance() or QApplication([])
+
+    rows = JsonRepeatingFieldRows(
+        ModuleField(
+            id="filenames",
+            label="filename",
+            field_type="text",
+            role="input",
+            default="",
+        ),
+        "input",
+    )
+
+    rows.set_count(2)
+    rows.rows[0].set_value("first.dat")
+    rows.rows[1].set_value("second.dat")
+
+    rows.set_count(3)
+    assert [row.value() for row in rows.rows] == [
+        "first.dat",
+        "second.dat",
+        "",
+    ]
+
+    rows.rows[2].set_value("third.dat")
+    rows.set_count(2)
+    assert [row.value() for row in rows.rows] == ["first.dat", "second.dat"]
+
+
+def test_integer_pair_headers_refresh_without_dimension_change():
+    configure_qt_plugin_paths()
+    app = QApplication.instance() or QApplication([])
+    row_headers = ["contrast 1", "contrast 2"]
+    column_headers = ["component A", "component B"]
+
+    matrix = JsonIntegerPairRepeatingFieldRows(
+        ModuleField(
+            id="delta_rho",
+            label="delta rho",
+            field_type="float",
+            role="input",
+            default="",
+        ),
+        "input",
+        dimensions_provider=lambda: (2, 2),
+        header_provider=lambda: (row_headers, column_headers),
+    )
+    matrix.edits[0][0].setText("1.0")
+    matrix.edits[1][1].setText("4.0")
+
+    row_headers[:] = ["D2O 0", "D2O 100"]
+    column_headers[:] = ["protein", "RNA"]
+    matrix.set_dimensions(2, 2)
+    app.processEvents()
+
+    label_texts = {label.text() for label in matrix.findChildren(QLabel)}
+    assert {"D2O 0", "D2O 100", "protein", "RNA"} <= label_texts
+    assert matrix.edits[0][0].text() == "1.0"
+    assert matrix.edits[1][1].text() == "4.0"
+
+
+def _module_page(window, tab_name):
+    for index in range(window.module_tabs.count()):
+        if window.module_tabs.tabText(index) == tab_name:
+            return window.module_tabs.widget(index)
+    return None
+
+
+def _select_category(window, category_label):
+    for row in range(window.category_list.count()):
+        item = window.category_list.item(row)
+        if item.text() == category_label:
+            window.category_list.setCurrentRow(row)
+            QApplication.processEvents()
+            return
+    labels = [
+        window.category_list.item(row).text()
+        for row in range(window.category_list.count())
+    ]
+    raise AssertionError(f"Category not found: {category_label!r}; got {labels!r}")
+
+
+def _set_combo_value(combo_box, value):
+    for index in range(combo_box.count()):
+        if combo_box.itemData(index) == value:
+            combo_box.setCurrentIndex(index)
+            return
+    raise AssertionError(f"Combo value not found: {value}")

@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import webbrowser
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -45,6 +47,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from sassie_qt.form_state import FormStateEngine
 from sassie_qt.menu_loader import (
     DEFAULT_GENAPP_ZAZZIE_ROOT,
     DEFAULT_ZAZZIE_ROOT,
@@ -56,15 +59,13 @@ from sassie_qt.menu_loader import (
     load_menu,
     load_module_definition,
 )
+from sassie_qt.module_registry import MODULE_RUNNER_FACTORIES
+from sassie_qt.modules.base import ModuleRunResult
 from sassie_qt.plotting.data_interpolation_plot import (
     export_data_interpolation_plotly_html,
     load_data_interpolation_plot_data,
 )
-from sassie_qt.runners.data_interpolation_runner import (
-    DataInterpolationInput,
-    DataInterpolationResult,
-    DataInterpolationRunner,
-)
+from sassie_qt.value_helpers import field_value_to_text, nested_values, split_repeated
 
 
 APPLICATION_ICON_PATH = Path(__file__).resolve().parent / "assets" / "sassie_icon.png"
@@ -99,8 +100,8 @@ def default_project_directory(base_directory: Path | None = None) -> Path:
     return (base_directory / DEFAULT_PROJECT_DIRECTORY_NAME).expanduser().resolve()
 
 
-class DataInterpolationWorker(QThread):
-    """Run data_interpolation off the GUI thread."""
+class ModuleWorker(QThread):
+    """Run a SASSIE module off the GUI thread."""
 
     message_received = Signal(str)
     progress_changed = Signal(float)
@@ -109,16 +110,21 @@ class DataInterpolationWorker(QThread):
 
     def __init__(
         self,
-        inputs: DataInterpolationInput,
+        runner,
+        project_directory: Path,
+        form_values: dict[str, str],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.inputs = inputs
+        self.runner = runner
+        self.project_directory = project_directory
+        self.form_values = form_values
 
     def run(self) -> None:
         try:
-            result = DataInterpolationRunner().run(
-                self.inputs,
+            result = self.runner.run(
+                self.project_directory,
+                self.form_values,
                 message_callback=self.message_received.emit,
                 progress_callback=self.progress_changed.emit,
             )
@@ -147,11 +153,21 @@ class ModuleStubPage(QWidget):
         self.project_directory = project_directory
         self.last_file_directories = last_file_directories
         self.input_rows: dict[str, JsonFieldRow] = {}
+        self.input_aux_controls: list[QWidget] = []
         self.output_rows: dict[str, JsonFieldRow] = {}
         self.plot_widgets: dict[str, DataInterpolationPlotWidget] = {}
         self.run_log_text: QTextEdit | None = None
         self.view_tabs: QTabWidget | None = None
-        self.active_worker: DataInterpolationWorker | None = None
+        self.active_worker: ModuleWorker | None = None
+        self.field_by_id = (
+            {field.id: field for field in module_definition.fields}
+            if module_definition is not None
+            else {}
+        )
+        self.form_engine = FormStateEngine(
+            module_definition.fields if module_definition is not None else ()
+        )
+        self._refreshing_dynamic_fields = False
         self._build_ui()
 
     def set_project_directory(self, project_directory: Path) -> None:
@@ -240,32 +256,41 @@ class ModuleStubPage(QWidget):
                 continue
             if role == "output" and field.field_type == "plotly":
                 continue
+            if field.id.startswith("separator_") and not field.label.strip():
+                continue
             if field.field_type == "label":
                 section_label = JsonSectionLabel(field.label)
+                section_label.field = field
                 _apply_tooltip(section_label, field.help_text)
+                if field.hidden:
+                    section_label.setVisible(False)
                 layout.addWidget(section_label)
+                if role == "input":
+                    self.input_aux_controls.append(section_label)
             else:
-                row = JsonFieldRow(
-                    field,
-                    role,
-                    project_directory_provider=lambda: self.project_directory,
-                    file_dialog_directory_provider=(
-                        lambda field_id=field.id: self._file_dialog_start_directory(field_id)
-                    ),
-                    file_source_directory_recorder=(
-                        lambda source_path, field_id=field.id: (
-                            self._remember_file_source_directory(field_id, source_path)
-                        )
-                    ),
-                )
+                row = self._build_field_control(field, role)
                 if role == "input":
                     self.input_rows[field.id] = row
                 else:
                     self.output_rows[field.id] = row
                 layout.addWidget(row)
-        if role == "input" and self.menu_item.id == "data_interpolation":
-            layout.addWidget(self._build_data_interpolation_actions())
-        if role == "output" and self.menu_item.id == "data_interpolation":
+        if role == "input" and self._has_runner():
+            self._connect_dynamic_input_fields()
+            layout.addWidget(self._build_module_actions())
+            self._refresh_dynamic_fields()
+        if role == "output" and self._has_runner():
+            if "progress_output" not in self.output_rows:
+                progress_row = JsonFieldRow(
+                    ModuleField(
+                        id="progress_output",
+                        label="progress:",
+                        field_type="progress",
+                        role="output",
+                    ),
+                    role,
+                )
+                self.output_rows["progress_output"] = progress_row
+                layout.addWidget(progress_row)
             layout.addWidget(JsonSectionLabel("Run Log"))
             self.run_log_text = QTextEdit()
             self.run_log_text.setObjectName("runLogText")
@@ -273,10 +298,54 @@ class ModuleStubPage(QWidget):
             self.run_log_text.document().setDocumentMargin(4)
             self.run_log_text.setMinimumHeight(340)
             layout.addWidget(self.run_log_text, 1)
-        if not (role == "output" and self.menu_item.id == "data_interpolation"):
+        if not (role == "output" and self._has_runner()):
             layout.addStretch(1)
         scroll_area.setWidget(container)
         return scroll_area
+
+    def _build_field_control(self, field: ModuleField, role: str) -> QWidget:
+        if role == "input" and self.form_engine.is_integer_pair_repeated_field(field):
+            row = JsonIntegerPairRepeatingFieldRows(
+                field,
+                role,
+                dimensions_provider=(
+                    lambda field_id=field.repeat: self._current_integer_pair_dimensions(field_id)
+                ),
+                header_provider=(
+                    lambda field_id=field.repeat: self._current_integer_pair_headers(field_id)
+                ),
+            )
+        elif role == "input" and self.form_engine.is_integer_repeated_field(field):
+            row = JsonRepeatingFieldRows(
+                field,
+                role,
+                project_directory_provider=lambda: self.project_directory,
+                file_dialog_directory_provider=(
+                    lambda field_id=field.id: self._file_dialog_start_directory(field_id)
+                ),
+                file_source_directory_recorder=(
+                    lambda source_path, field_id=field.id: (
+                        self._remember_file_source_directory(field_id, source_path)
+                    )
+                ),
+            )
+        else:
+            row = JsonFieldRow(
+                field,
+                role,
+                project_directory_provider=lambda: self.project_directory,
+                file_dialog_directory_provider=(
+                    lambda field_id=field.id: self._file_dialog_start_directory(field_id)
+                ),
+                file_source_directory_recorder=(
+                    lambda source_path, field_id=field.id: (
+                        self._remember_file_source_directory(field_id, source_path)
+                    )
+                ),
+            )
+        if field.hidden:
+            row.setVisible(False)
+        return row
 
     def _build_plot_preview(self) -> QWidget:
         scroll_area = QScrollArea()
@@ -315,7 +384,10 @@ class ModuleStubPage(QWidget):
             if field.role == "output" and field.field_type == "plotly"
         ]
 
-    def _build_data_interpolation_actions(self) -> QWidget:
+    def _has_runner(self) -> bool:
+        return self.menu_item.id in MODULE_RUNNER_FACTORIES
+
+    def _build_module_actions(self) -> QWidget:
         actions = QWidget()
         layout = QHBoxLayout(actions)
         layout.setContentsMargins(0, 8, 0, 0)
@@ -327,23 +399,26 @@ class ModuleStubPage(QWidget):
 
         run_button = QPushButton("Run")
         run_button.setObjectName("primaryButton")
-        run_button.clicked.connect(self._run_data_interpolation)
+        run_button.clicked.connect(self._run_module)
         layout.addWidget(run_button)
         return actions
 
     def _reset_input_fields(self) -> None:
         for row in self.input_rows.values():
-            row.reset_value()
+            if hasattr(row, "reset_value"):
+                row.reset_value()
+        self._refresh_dynamic_fields()
 
-    def _run_data_interpolation(self) -> None:
+    def _run_module(self) -> None:
         if self.active_worker is not None and self.active_worker.isRunning():
-            message = "A data interpolation run is already active."
+            message = f"A {self.menu_item.label} run is already active."
             self._append_run_log(f"{message}\n")
             self._show_warning(message)
             return
 
         try:
-            inputs = self._collect_data_interpolation_inputs()
+            form_values = self._collect_form_values()
+            runner = MODULE_RUNNER_FACTORIES[self.menu_item.id]()
         except ValueError as error:
             self._set_progress(0.0)
             self._append_run_log(f"{error}\n")
@@ -353,10 +428,10 @@ class ModuleStubPage(QWidget):
 
         self._clear_output_widgets()
         self._set_progress(0.0)
-        self._append_run_log("Starting data interpolation...\n")
+        self._append_run_log(f"Starting {self.menu_item.label}...\n")
         self._show_output_tab()
 
-        worker = DataInterpolationWorker(inputs)
+        worker = ModuleWorker(runner, self.project_directory, form_values)
         worker.message_received.connect(self._append_run_log)
         worker.progress_changed.connect(self._set_progress)
         worker.finished_successfully.connect(self._handle_run_success)
@@ -365,52 +440,14 @@ class ModuleStubPage(QWidget):
         self.active_worker = worker
         worker.start()
 
-    def _collect_data_interpolation_inputs(self) -> DataInterpolationInput:
-        required_fields = [
-            "run_name",
-            "data_file_name",
-            "output_file_name",
-            "izero",
-            "izero_error",
-            "delta_q",
-            "maximum_points",
-        ]
-        missing_fields = [
-            field_id for field_id in required_fields if field_id not in self.input_rows
-        ]
-        if missing_fields:
-            raise ValueError(f"Missing data_interpolation fields: {', '.join(missing_fields)}")
-
-        run_directory = self.project_directory.expanduser()
-        run_name = self.input_rows["run_name"].value().strip()
-        data_file_name = self.input_rows["data_file_name"].value().strip()
-        output_file_name = self.input_rows["output_file_name"].value().strip()
-
-        if not str(run_directory).strip():
-            raise ValueError("Choose a project directory before running.")
-        if not run_name:
-            raise ValueError("Enter a run name before running.")
-        if not data_file_name:
-            raise ValueError("Choose an experimental data file before running.")
-        if not output_file_name:
-            raise ValueError("Enter an output file name before running.")
-
-        data_file_path = Path(data_file_name).expanduser()
-        if data_file_path.is_dir():
-            raise ValueError("Choose an experimental data file, not a directory.")
-        if not data_file_path.exists():
-            raise ValueError(f"Experimental data file does not exist: {data_file_path}")
-
-        return DataInterpolationInput(
-            run_directory=run_directory,
-            run_name=run_name,
-            data_file_name=data_file_path,
-            output_file_name=output_file_name,
-            izero=self.input_rows["izero"].value(),
-            izero_error=self.input_rows["izero_error"].value(),
-            delta_q=self.input_rows["delta_q"].value(),
-            maximum_points=self.input_rows["maximum_points"].value(),
-        )
+    def _collect_form_values(self) -> dict[str, str]:
+        values = {}
+        for field_id, row in self.input_rows.items():
+            if hasattr(row, "value"):
+                values[field_id] = row.value()
+        if "runname" in values and "run_name" not in values:
+            values["run_name"] = values["runname"]
+        return values
 
     def _show_output_tab(self) -> None:
         if self.view_tabs is None:
@@ -440,19 +477,26 @@ class ModuleStubPage(QWidget):
         if progress_row is not None:
             progress_row.set_progress(progress)
 
-    def _handle_run_success(self, result: DataInterpolationResult) -> None:
+    def _handle_run_success(self, result: ModuleRunResult) -> None:
         self._set_progress(1.0)
         self._append_run_log("\nRun complete.\n")
-        self._append_run_log(f"Output: {result.output_file}\n")
-        self._append_run_log(f"S/N output: {result.signal_to_noise_output_file}\n")
-        self._append_run_log(f"Plot JSON: {result.plot_json_file}\n")
-        try:
-            self._set_data_interpolation_plot(result.plot_json_file)
-        except Exception as error:
-            self._append_run_log(f"Plot update failed: {error}\n")
-            self._show_warning(f"Run complete, but the plot could not be loaded:\n{error}")
-            return
-        self._show_plots_tab()
+        for output_file in result.output_files:
+            self._append_run_log(f"Output: {output_file}\n")
+        if result.module == "data_interpolation":
+            plot_json_file = next(
+                (path for path in result.output_files if path.suffix == ".json"),
+                None,
+            )
+            if plot_json_file is None:
+                self._append_run_log("Plot update skipped: no plot JSON was produced.\n")
+                return
+            try:
+                self._set_data_interpolation_plot(plot_json_file)
+            except Exception as error:
+                self._append_run_log(f"Plot update failed: {error}\n")
+                self._show_warning(f"Run complete, but the plot could not be loaded:\n{error}")
+                return
+            self._show_plots_tab()
 
     def _handle_run_failure(self, error: str) -> None:
         self._append_run_log(f"\nRun failed:\n{error}\n")
@@ -462,10 +506,10 @@ class ModuleStubPage(QWidget):
         self.active_worker = None
 
     def _show_warning(self, message: str) -> None:
-        QMessageBox.warning(self, "Data Interpolation", message)
+        QMessageBox.warning(self, self.menu_item.label, message)
 
     def _show_error(self, message: str) -> None:
-        QMessageBox.critical(self, "Data Interpolation Failed", message)
+        QMessageBox.critical(self, f"{self.menu_item.label} Failed", message)
 
     def _show_plots_tab(self) -> None:
         if self.view_tabs is None:
@@ -480,6 +524,63 @@ class ModuleStubPage(QWidget):
         if plot_widget is None:
             return
         plot_widget.set_plot_data(plot_data_file)
+
+    def _connect_dynamic_input_fields(self) -> None:
+        for row in self.input_rows.values():
+            if hasattr(row, "value_changed"):
+                row.value_changed.connect(self._refresh_dynamic_fields)
+
+    def _refresh_dynamic_fields(self) -> None:
+        if self._refreshing_dynamic_fields:
+            return
+        self._refreshing_dynamic_fields = True
+        try:
+            form_state = self.form_engine.evaluate(self._collect_form_values())
+            self._apply_synced_form_values(form_state.values)
+            form_state = self.form_engine.evaluate(self._collect_form_values())
+            self._apply_form_state(form_state)
+        finally:
+            self._refreshing_dynamic_fields = False
+
+    def _apply_synced_form_values(self, values: dict[str, str]) -> None:
+        for field_id, value in values.items():
+            row = self.input_rows.get(field_id)
+            if row is None or not hasattr(row, "set_value") or not hasattr(row, "value"):
+                continue
+            field = getattr(row, "field", self.field_by_id.get(field_id))
+            if field is None or not field.hidden or not field.sync:
+                continue
+            if row.value() != value:
+                row.set_value(value)
+
+    def _apply_form_state(self, form_state) -> None:
+        for field_id, row in self._dynamic_input_controls():
+            field = getattr(row, "field", self.field_by_id.get(field_id))
+            if field is None:
+                continue
+            field_state = form_state.fields.get(field_id)
+            if field_state is None:
+                continue
+            if isinstance(row, JsonRepeatingFieldRows):
+                row.set_count(field_state.repeat_count)
+            elif isinstance(row, JsonIntegerPairRepeatingFieldRows):
+                dimensions = field_state.integer_pair_dimensions or (1, 1)
+                row.set_dimensions(*dimensions)
+            row.setVisible(field_state.visible)
+
+    def _dynamic_input_controls(self) -> list[tuple[str, QWidget]]:
+        controls: list[tuple[str, QWidget]] = list(self.input_rows.items())
+        for row in self.input_aux_controls:
+            field = getattr(row, "field", None)
+            if field is not None:
+                controls.append((field.id, row))
+        return controls
+
+    def _current_integer_pair_dimensions(self, field_id: str) -> tuple[int, int]:
+        return self.form_engine.integer_pair_dimensions(field_id, self._collect_form_values())
+
+    def _current_integer_pair_headers(self, field_id: str) -> tuple[list[str], list[str]]:
+        return self.form_engine.integer_pair_headers(field_id, self._collect_form_values())
 
     def _file_dialog_start_directory(self, field_id: str) -> Path:
         remembered_directory = self.last_file_directories.get(
@@ -1048,6 +1149,8 @@ class DataInterpolationPlotCanvas(pg.PlotWidget):
 class JsonFieldRow(QFrame):
     """A compact stub widget row for one GenApp JSON field."""
 
+    value_changed = Signal()
+
     def __init__(
         self,
         field: ModuleField,
@@ -1090,6 +1193,7 @@ class JsonFieldRow(QFrame):
         if field_type == "checkbox":
             checkbox = QCheckBox()
             checkbox.setChecked(str(self.field.default).lower() == "true")
+            checkbox.toggled.connect(lambda *_args: self.value_changed.emit())
             self.value_widget = checkbox
             return checkbox
 
@@ -1101,6 +1205,7 @@ class JsonFieldRow(QFrame):
                     combo_box.setCurrentText(label)
             if combo_box.count() == 0:
                 combo_box.addItem(_field_value_to_text(self.field.default))
+            combo_box.currentIndexChanged.connect(lambda *_args: self.value_changed.emit())
             self.value_widget = combo_box
             return combo_box
 
@@ -1109,6 +1214,7 @@ class JsonFieldRow(QFrame):
             layout = QHBoxLayout(wrapper)
             layout.setContentsMargins(0, 0, 0, 0)
             line_edit = QLineEdit(_field_value_to_text(self.field.default))
+            line_edit.textChanged.connect(lambda *_args: self.value_changed.emit())
             line_edit.setPlaceholderText("Choose a local file" if field_type == "lrfile" else "Choose a path")
             browse_button = QPushButton("Browse")
             if field_type == "lrfile":
@@ -1139,6 +1245,8 @@ class JsonFieldRow(QFrame):
             default_values = _field_value_to_text(self.field.default).split(",")
             first = QLineEdit(default_values[0].strip() if default_values else "")
             second = QLineEdit(default_values[1].strip() if len(default_values) > 1 else "")
+            first.textChanged.connect(lambda *_args: self.value_changed.emit())
+            second.textChanged.connect(lambda *_args: self.value_changed.emit())
             first.setPlaceholderText("first")
             second.setPlaceholderText("second")
             layout.addWidget(first)
@@ -1147,6 +1255,7 @@ class JsonFieldRow(QFrame):
             return wrapper
 
         line_edit = QLineEdit(_field_value_to_text(self.field.default))
+        line_edit.textChanged.connect(lambda *_args: self.value_changed.emit())
         if field_type == "integer":
             line_edit.setPlaceholderText("integer")
         elif field_type == "float":
@@ -1283,12 +1392,272 @@ class JsonFieldRow(QFrame):
             self.value_widget.setText(text)
 
 
+class JsonRepeatingFieldRows(QFrame):
+    """A field rendered as N sibling rows for GenApp integer repeaters."""
+
+    value_changed = Signal()
+
+    def __init__(
+        self,
+        field: ModuleField,
+        role: str,
+        project_directory_provider: Callable[[], Path] | None = None,
+        file_dialog_directory_provider: Callable[[], Path] | None = None,
+        file_source_directory_recorder: Callable[[Path], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.field = field
+        self.role = role
+        self.project_directory_provider = project_directory_provider
+        self.file_dialog_directory_provider = file_dialog_directory_provider
+        self.file_source_directory_recorder = file_source_directory_recorder
+        self.rows: list[JsonFieldRow] = []
+        self.setObjectName("jsonRepeatingFieldRows")
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(6)
+        self.set_count(1)
+
+    def set_count(self, count: int) -> None:
+        count = max(1, count)
+        if len(self.rows) == count:
+            return
+
+        current_values = [row.value() for row in self.rows]
+        while self.layout.count():
+            item = self.layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.rows = []
+
+        for index in range(count):
+            label = self.field.label
+            if count > 1:
+                label = f"{label} {index + 1}"
+            row = JsonFieldRow(
+                replace(self.field, label=label),
+                self.role,
+                project_directory_provider=self.project_directory_provider,
+                file_dialog_directory_provider=self.file_dialog_directory_provider,
+                file_source_directory_recorder=self.file_source_directory_recorder,
+            )
+            row.value_changed.connect(self.value_changed.emit)
+            if index < len(current_values):
+                row.set_value(current_values[index])
+            self.rows.append(row)
+            self.layout.addWidget(row)
+        self.value_changed.emit()
+
+    def value(self) -> str:
+        return ",".join(row.value().strip() for row in self.rows if row.value().strip())
+
+    def reset_value(self) -> None:
+        for row in self.rows:
+            row.reset_value()
+
+    def set_value(self, value: str) -> None:
+        values = split_repeated(value)
+        self.set_count(max(1, len(values)))
+        for index, row in enumerate(self.rows):
+            row.set_value(values[index] if index < len(values) else "")
+
+    def clear_output(self) -> None:
+        for row in self.rows:
+            row.clear_output()
+
+    def set_progress(self, progress: float) -> None:
+        for row in self.rows:
+            row.set_progress(progress)
+
+    def set_output_text(self, text: str) -> None:
+        for row in self.rows:
+            row.set_output_text(text)
+
+
+class JsonIntegerPairRepeatingFieldRows(QFrame):
+    """A two-dimensional GenApp integerpair repeater rendered as a matrix."""
+
+    value_changed = Signal()
+
+    def __init__(
+        self,
+        field: ModuleField,
+        role: str,
+        dimensions_provider: Callable[[], tuple[int, int]],
+        header_provider: Callable[[], tuple[list[str], list[str]]] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.field = field
+        self.role = role
+        self.dimensions_provider = dimensions_provider
+        self.header_provider = header_provider
+        self.edits: list[list[QLineEdit]] = []
+        self._rendered_headers: tuple[tuple[str, ...], tuple[str, ...]] = ((), ())
+        self.setObjectName("jsonIntegerPairRepeatingFieldRows")
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(6)
+        self.set_dimensions(*self.dimensions_provider())
+
+    def set_dimensions(self, row_count: int, column_count: int) -> None:
+        row_count = max(1, row_count)
+        column_count = max(1, column_count)
+        row_headers, column_headers = self._headers()
+        headers = (tuple(row_headers), tuple(column_headers))
+        if (
+            len(self.edits) == row_count
+            and self.edits
+            and len(self.edits[0]) == column_count
+            and self._rendered_headers == headers
+        ):
+            return
+
+        current_values = self._values()
+        while self.layout.count():
+            item = self.layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.edits = []
+
+        frame = QFrame()
+        frame.setObjectName("jsonFieldRow")
+        frame.setFrameShape(QFrame.StyledPanel)
+        _apply_tooltip(frame, self.field.help_text)
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(12, 9, 12, 9)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(7)
+
+        title = QLabel(self.field.label)
+        title.setWordWrap(True)
+        _apply_tooltip(title, self.field.help_text)
+        grid.addWidget(title, 0, 0)
+
+        for column in range(column_count):
+            label = QLabel(
+                column_headers[column]
+                if column < len(column_headers)
+                else f"component {column + 1}"
+            )
+            label.setObjectName("metadataLabel")
+            label.setAlignment(Qt.AlignCenter)
+            grid.addWidget(label, 0, column + 1)
+
+        default_values = self._default_matrix_values(row_count, column_count)
+        for row_index in range(row_count):
+            row_label = QLabel(
+                row_headers[row_index]
+                if row_index < len(row_headers)
+                else f"contrast {row_index + 1}"
+            )
+            row_label.setObjectName("metadataLabel")
+            row_label.setWordWrap(True)
+            grid.addWidget(row_label, row_index + 1, 0)
+
+            row_edits = []
+            for column_index in range(column_count):
+                edit = QLineEdit()
+                edit.setText(
+                    self._matrix_value(
+                        current_values,
+                        row_index,
+                        column_index,
+                        self._matrix_value(
+                            default_values,
+                            row_index,
+                            column_index,
+                            "",
+                        ),
+                    )
+                )
+                edit.textChanged.connect(lambda *_args: self.value_changed.emit())
+                _apply_tooltip(edit, self.field.help_text)
+                row_edits.append(edit)
+                grid.addWidget(edit, row_index + 1, column_index + 1)
+            self.edits.append(row_edits)
+
+        self.layout.addWidget(frame)
+        self._rendered_headers = headers
+        self.value_changed.emit()
+
+    def value(self) -> str:
+        return ";".join(
+            ",".join(edit.text().strip() for edit in row)
+            for row in self.edits
+        )
+
+    def reset_value(self) -> None:
+        self.set_value(self._default_matrix_text())
+
+    def set_value(self, value: str) -> None:
+        values = nested_values(value)
+        row_count = max(1, len(values))
+        column_count = max(1, max((len(row) for row in values), default=1))
+        self.set_dimensions(row_count, column_count)
+        for row_index, row in enumerate(self.edits):
+            for column_index, edit in enumerate(row):
+                edit.setText(self._matrix_value(values, row_index, column_index, ""))
+
+    def clear_output(self) -> None:
+        return
+
+    def set_progress(self, _progress: float) -> None:
+        return
+
+    def set_output_text(self, _text: str) -> None:
+        return
+
+    def _headers(self) -> tuple[list[str], list[str]]:
+        if self.header_provider is None:
+            return ([], [])
+        return self.header_provider()
+
+    def _values(self) -> list[list[str]]:
+        return [[edit.text().strip() for edit in row] for row in self.edits]
+
+    def _default_matrix_values(
+        self,
+        row_count: int,
+        column_count: int,
+    ) -> list[list[str]]:
+        values = _raw_default_matrix_values(self.field.default)
+        if not values:
+            values = [["" for _column in range(column_count)] for _row in range(row_count)]
+        return values
+
+    def _default_matrix_text(self) -> str:
+        return ";".join(",".join(row) for row in _raw_default_matrix_values(self.field.default))
+
+    def _matrix_value(
+        self,
+        values: list[list[str]],
+        row_index: int,
+        column_index: int,
+        default: str,
+    ) -> str:
+        if row_index >= len(values) or column_index >= len(values[row_index]):
+            return default
+        return values[row_index][column_index]
+
+
 def _field_value_to_text(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return ", ".join(str(item) for item in value)
-    return str(value)
+    return field_value_to_text(value, list_separator=", ")
+
+
+def _raw_default_matrix_values(value) -> list[list[str]]:
+    if isinstance(value, list):
+        rows = []
+        for row in value:
+            if isinstance(row, list):
+                rows.append([str(cell) for cell in row])
+            else:
+                rows.append([str(row)])
+        return rows
+    return nested_values(_field_value_to_text(value))
 
 
 def _parse_genapp_values(values) -> list[tuple[str, str]]:

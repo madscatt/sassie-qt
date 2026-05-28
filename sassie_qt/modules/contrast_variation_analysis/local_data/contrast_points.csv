@@ -1,0 +1,4 @@
+experimental_data_file,source,d2o_percentage,contrast_weight
+experimental_01.dat,neutron,0,1
+experimental_02.dat,neutron,85,1
+experimental_03.dat,xray,0,1
